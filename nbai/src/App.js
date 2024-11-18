@@ -5,7 +5,7 @@ function App() {
   return (
     <div className="App">
       <header className="App-header">
-        <img src={logo} className="App-logo" alt="logo" />
+        <img src= "/nbai_logo.png" className="App-logo" alt="NBAI logo" />
         <p>
           MB-AI Pridiction in Machine Learning.!
         </p>
