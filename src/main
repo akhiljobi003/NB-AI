@@ -1,1 +1,189 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_curve, auc
+from sklearn.preprocessing import LabelEncoder
+from nba_api.stats.endpoints import leaguegamefinder
+from nba_api.stats.static import teams
+import matplotlib.pyplot as plt
+import seaborn as sns
+import shap
 
+# Function to get valid team abbreviation from user
+def get_valid_team_abbr(prompt):
+    nba_teams = teams.get_teams()
+    team_abbr_to_id = {team['abbreviation']: team['id'] for team in nba_teams}
+    while True:
+        abbr = input(prompt).upper()
+        if abbr in team_abbr_to_id:
+            return abbr
+        else:
+            print(f"Invalid team abbreviation. Please try again.")
+
+# Get user input for teams
+team1_abbr = get_valid_team_abbr("Enter the abbreviation for the first team: ")
+team2_abbr = get_valid_team_abbr("Enter the abbreviation for the second team: ")
+
+# Get home game information
+while True:
+    home_game_input = input(f"Is this a home game for {team1_abbr}? (yes/no): ").lower()
+    if home_game_input in ['yes', 'no']:
+        is_home_game = home_game_input == 'yes'
+        break
+    else:
+        print("Please enter 'yes' or 'no'.")
+
+# Step 1: Fetch and preprocess data
+nba_teams = teams.get_teams()
+team_abbr_to_id = {team['abbreviation']: team['id'] for team in nba_teams}
+team_id_to_abbr = {team['id']: team['abbreviation'] for team in nba_teams}
+all_games = pd.DataFrame()
+
+for team in nba_teams:
+    team_id = team['id']
+    gamefinder = leaguegamefinder.LeagueGameFinder(team_id_nullable=team_id)
+    games = gamefinder.get_data_frames()[0]
+    all_games = pd.concat([all_games, games], ignore_index=True)
+
+# Step 2: Preprocess data
+all_games['GAME_DATE'] = pd.to_datetime(all_games['GAME_DATE'])
+all_games['WIN'] = all_games['WL'].apply(lambda x: 1 if x == 'W' else 0)
+all_games['PTS'] = all_games['PTS'].astype(float)
+all_games['Points_Per_Game'] = all_games.groupby('TEAM_ID')['PTS'].transform('mean')
+
+def get_opponent_team_id(matchup, team_abbr_to_id, team_id):
+    if '@' in matchup:
+        opponent_abbr = matchup.split(' @ ')[-1]
+    else:
+        opponent_abbr = matchup.split(' vs. ')[-1]
+    return team_abbr_to_id.get(opponent_abbr, team_id)
+
+all_games['OPPONENT_TEAM_ID'] = all_games.apply(
+    lambda row: get_opponent_team_id(row['MATCHUP'], team_abbr_to_id, row['TEAM_ID']), axis=1
+)
+
+all_games['HOME_GAME'] = all_games['MATCHUP'].apply(lambda x: 1 if 'vs.' in x else 0)
+all_games['LAST_GAME_RESULT'] = all_games.sort_values('GAME_DATE').groupby('TEAM_ID')['WIN'].shift(1).fillna(0)
+
+# Step 3: Prepare data for model
+le = LabelEncoder()
+all_games['TEAM_ID'] = le.fit_transform(all_games['TEAM_ID'])
+all_games['OPPONENT_TEAM_ID'] = le.transform(all_games['OPPONENT_TEAM_ID'])
+
+# Step 4: Split data
+X = all_games[['TEAM_ID', 'OPPONENT_TEAM_ID', 'Points_Per_Game', 'HOME_GAME', 'LAST_GAME_RESULT']]
+y = all_games['WIN']
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Step 5: Train model
+model = RandomForestClassifier(n_estimators=100, random_state=42)
+model.fit(X_train, y_train)
+
+# Step 6: Evaluate model
+y_pred = model.predict(X_test)
+print("Accuracy:", accuracy_score(y_test, y_pred))
+print(classification_report(y_test, y_pred))
+
+# Step 7: Feature importance
+feature_importances = pd.DataFrame(model.feature_importances_,
+                                   index=X_train.columns,
+                                   columns=['importance']).sort_values('importance', ascending=False)
+print("Feature Importances:\n", feature_importances)
+
+# Step 8: Prediction function
+def predict_game(team_abbr, opponent_abbr, is_home_game):
+    team_id = team_abbr_to_id[team_abbr]
+    opponent_id = team_abbr_to_id[opponent_abbr]
+
+    # Get average points per game
+    team_avg_points = all_games[all_games['TEAM_ID'] == le.transform([team_id])[0]]['Points_Per_Game'].mean()
+
+    # Get last game result
+    team_games = all_games[all_games['TEAM_ID'] == le.transform([team_id])[0]].sort_values('GAME_DATE')
+    last_game_result = team_games['WIN'].iloc[-1] if len(team_games) > 0 else 0
+
+    new_data = pd.DataFrame({
+        'TEAM_ID': [le.transform([team_id])[0]],
+        'OPPONENT_TEAM_ID': [le.transform([opponent_id])[0]],
+        'Points_Per_Game': [team_avg_points],
+        'HOME_GAME': [1 if is_home_game else 0],
+        'LAST_GAME_RESULT': [last_game_result]
+    })
+
+    prediction = model.predict(new_data)
+    prediction_proba = model.predict_proba(new_data)
+
+    return prediction[0], prediction_proba[0]
+
+# Make prediction
+prediction, probabilities = predict_game(team1_abbr, team2_abbr, is_home_game)
+
+# Display results
+print(f"\nPrediction for {team1_abbr} vs {team2_abbr} ({'Home' if is_home_game else 'Away'} game for {team1_abbr}):")
+print(f"Predicted winner: {team1_abbr if prediction == 1 else team2_abbr}")
+print(f"Probability of {team1_abbr} winning: {probabilities[1]:.2f}")
+print(f"Probability of {team2_abbr} winning: {probabilities[0]:.2f}")
+
+# Visualizations
+# 1. Feature Importance Plot
+plt.figure(figsize=(10, 6))
+sns.barplot(x='importance', y=feature_importances.index, data=feature_importances)
+plt.title('Feature Importance in NBA Game Prediction')
+plt.xlabel('Importance')
+plt.ylabel('Features')
+plt.tight_layout()
+plt.show()
+
+# 2. Confusion Matrix
+cm = confusion_matrix(y_test, y_pred)
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+plt.title('Confusion Matrix')
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.tight_layout()
+plt.show()
+
+# 3. ROC Curve
+fpr, tpr, _ = roc_curve(y_test, model.predict_proba(X_test)[:, 1])
+roc_auc = auc(fpr, tpr)
+
+plt.figure(figsize=(8, 6))
+plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.2f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Receiver Operating Characteristic (ROC) Curve')
+plt.legend(loc="lower right")
+plt.tight_layout()
+plt.show()
+
+# 4. Distribution of Prediction Probabilities
+plt.figure(figsize=(10, 6))
+sns.histplot(model.predict_proba(X_test)[:, 1], kde=True, bins=30)
+plt.title('Distribution of Prediction Probabilities')
+plt.xlabel('Probability of Winning')
+plt.ylabel('Frequency')
+plt.tight_layout()
+plt.show()
+
+# 5. Prediction Visualization
+plt.figure(figsize=(10, 6))
+teams = [team1_abbr, team2_abbr]
+probs = [probabilities[1], probabilities[0]]
+colors = ['green' if prediction == 1 else 'red', 'red' if prediction == 1 else 'green']
+
+plt.bar(teams, probs, color=colors)
+plt.title(f'Prediction: {team1_abbr} vs {team2_abbr}')
+plt.xlabel('Teams')
+plt.ylabel('Probability of Winning')
+plt.ylim(0, 1)
+
+for i, v in enumerate(probs):
+    plt.text(i, v + 0.01, f'{v:.2f}', ha='center', va='bottom')
+
+plt.tight_layout()
+plt.show()
